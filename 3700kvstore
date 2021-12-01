@@ -21,14 +21,14 @@ last_heartbeat_recv = time.time()
 # The amount of time (in seconds) that a server can go without a heartbeat,
 # if this amount of time passes with no heartbeat from the leader then start an election
 # in the range [2.4-2.6)
-election_timeout = (random.random() / 5.0) + 2.4
+election_timeout = (random.random() / 5.0) + 1
 
 # The maximum amount of time that an election can take to happen, if this amount of
 # time goes by without a winner start a new election. Needs to be randomized in the case
 # that there is a split vote, so that multiple servers are unlikely to start their next
 # elections at the same time preventing another split election
 # In the range [0.4-1.4)
-election_window = random.random() + 0.4
+election_window = random.random() + 0.2
 
 
 # The state that this server is currently in
@@ -62,7 +62,7 @@ last_heartbeat_sent = 0
 
 # The interval that the server should send out a heartbeat, must be smaller than the
 # election_timeout
-heartbeat_interval = 2
+heartbeat_interval = 0.1
 
 # -----------------Messages-----------------#
 # The types of messages that can be sent or received
@@ -87,7 +87,7 @@ KEY = 'key'
 VAL = 'value'
 OK = 'ok'
 
-debug = False
+debug = True
 debug_data = ""
 
 # -----------------Key-Value Pairs-----------------#
@@ -139,11 +139,11 @@ def handle_get_put(message):
                    "type": OK, "MID": message[MID], "value": ""}
         sock.send(json.dumps(msg).encode() + b'\n')
     elif message[TYPE] == PUT:
-        if key in master_dict:
-            log("Trying to overwrite a new key, error?")
-        else:
-            log("Updating master dict with key " + key + " and value " + message[VAL])
-            master_dict[key] = message[VAL]
+        log("Updating master dict with key " + key + " and value " + message[VAL])
+        master_dict[key] = message[VAL]
+        msg = {"src": my_id, "dst": message[SRCE], "leader": leader_id,
+                "type": OK, "MID": message[MID]}
+        sock.send(json.dumps(msg).encode() + b'\n')
     else:
         raise ValueError("Sent a message to handle_get_put() that was not a GET or PUT request!")
 
@@ -213,7 +213,7 @@ while True:
             elif msg_type == VOTE and my_state == State.candidate:
                 log("received a vote, updating tally")
                 votes_received += 1
-                if votes_received > len(replica_ids) / 2.0:
+                if votes_received > len(replica_ids) // 2.0:
                     # The election is won, set this server to the leader
                     log("Votes received is greater than the number of replicas / 2, this replica won")
                     my_state = State.leader
