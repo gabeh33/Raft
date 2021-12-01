@@ -179,7 +179,7 @@ while True:
 
             # For now, ignore get() and put() from clients
             msg_type = msg[TYPE]
-            mid_received = msg_type[MID]
+            mid_received = msg[MID]
 
             if msg_type in [GET, PUT]:
                 if my_state == State.follower:
