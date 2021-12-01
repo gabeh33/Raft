@@ -1,0 +1,253 @@
+#!/usr/bin/env python3
+import enum
+import sys, socket, select, time, json, random
+
+# -----------------Program Arguments and Socket Connection-----------------#
+# Your ID number
+my_id = str(sys.argv[1])
+
+# The ID numbers of all the other replicas
+replica_ids = sys.argv[2:]
+
+# Connect to the network. All messages to/from other replicas and clients will
+# occur over this socket
+sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+sock.connect(my_id)
+
+# -----------------Election and Leader/Candidate/Follower variables-----------------#
+# The amount of time since the last heartbeat message, start it at the current time
+last_heartbeat_recv = time.time()
+
+# The amount of time (in seconds) that a server can go without a heartbeat,
+# if this amount of time passes with no heartbeat from the leader then start an election
+# in the range [2.4-2.6)
+election_timeout = (random.random() / 5.0) + 2.4
+
+# The maximum amount of time that an election can take to happen, if this amount of
+# time goes by without a winner start a new election. Needs to be randomized in the case
+# that there is a split vote, so that multiple servers are unlikely to start their next
+# elections at the same time preventing another split election
+# In the range [0.4-1.4)
+election_window = random.random() + 0.4
+
+
+# The state that this server is currently in
+# servers start as followers, only leaders respond to client requests
+class State(enum.Enum):
+    leader = 1
+    candidate = 2
+    follower = 3
+
+
+my_state = State.follower
+
+# The id of who the server thinks is the leader
+leader_id = "FFFF"
+
+# The number of the current term, start at 0 increment every time
+# this server receives news of a new election
+current_term = 0
+
+# The amount of votes this server has received, only matters when this server is a candidate
+votes_received = 0
+
+# A list of terms that this server has voted in, can only vote in a term once
+terms_voted = []
+
+# Start time of the most recent election
+election_start = 0
+
+# The last time this server sent out a heartbeat
+last_heartbeat_sent = 0
+
+# The interval that the server should send out a heartbeat, must be smaller than the
+# election_timeout
+heartbeat_interval = 2
+
+# -----------------Messages-----------------#
+# The types of messages that can be sent or received
+GET = "get"
+PUT = "put"
+RD = "redirect"
+OK = "ok"
+FAIL = "fail"
+HB = "heartbeat"
+RV = "requestVote"
+VOTE = "vote"
+
+# Fields of messages that must be there
+SRCE = 'src'
+DEST = 'dst'
+LEADER = 'leader'
+TYPE = 'type'
+# Other fields
+MID = 'MID'
+TERM = 'term'  # Only for request vote RPCs, the term of the election to vote in
+KEY = 'key'
+VAL = 'value'
+OK = 'ok'
+
+debug = False
+debug_data = ""
+
+# -----------------Key-Value Pairs-----------------#
+master_dict = {}
+
+# -----------------Variables Given------------------#
+
+last = 0
+
+SELECT_WAIT_TIME = 0.01  # 10 milliseconds
+TERMINATOR = b'}\n'
+buffer = b''
+
+
+# Print the output given if debug is True
+def log(string):
+    if debug:
+        print(string)
+
+
+# Generate an id string based on the ascii values of the string given
+def string_to_mid(string):
+    result = 1
+    for i in range(len(string)):
+        result *= ord(string[i])
+    return str(result)
+
+
+# send a basic message message
+def send_msg(dest_addr: str, type: str, mid: str):
+    msg = {"src": my_id, "dst": dest_addr, "leader": leader_id,
+           "type": type, "MID": mid}
+    sock.send(json.dumps(msg).encode() + b'\n')
+
+
+def handle_get_put(message):
+    key = message[KEY]
+    if message[TYPE] == GET:
+        if key in master_dict:
+            # Key is in there, send it in an OK message
+            log("Received a GET request for " + KEY + ", returning " + master_dict[key])
+            msg = {"src": my_id, "dst": message[SRCE], "leader": leader_id,
+                   "type": OK, "MID": message[MID], "value": master_dict[key]}
+
+        else:
+            # Key is not there, send an empty message back
+            log(KEY + " Not in master dict, sending a empty string back")
+            msg = {"src": my_id, "dst": message[SRCE], "leader": leader_id,
+                   "type": OK, "MID": message[MID], "value": ""}
+        sock.send(json.dumps(msg).encode() + b'\n')
+    elif message[TYPE] == PUT:
+        if key in master_dict:
+            log("Trying to overwrite a new key, error?")
+        else:
+            log("Updating master dict with key " + key + " and value " + message[VAL])
+            master_dict[key] = message[VAL]
+    else:
+        raise ValueError("Sent a message to handle_get_put() that was not a GET or PUT request!")
+
+
+# Receive
+def recv_msgs(sock):
+    global buffer
+
+    fresh_buf = sock.recv(16384)
+
+    # is this sock shutting down?
+    if len(fresh_buf) == 0:
+        return None
+
+    buffer += fresh_buf
+
+    msgs = []
+    while TERMINATOR in buffer:
+        position = buffer.find(TERMINATOR) + len(TERMINATOR)
+        msgs.append(json.loads(buffer[:position - 1].decode()))  # -1 to remove the \n, which json.loads won't want
+        buffer = buffer[position:]
+
+    return msgs
+
+
+while True:
+    ready = select.select([sock], [], [], SELECT_WAIT_TIME)[0]
+
+    if sock in ready:
+        msgs = recv_msgs(sock)
+
+        for msg in msgs:
+
+            # For now, ignore get() and put() from clients
+            msg_type = msg[TYPE]
+            mid_received = msg_type[MID]
+
+            if msg_type in [GET, PUT]:
+                if my_state == State.follower:
+                    # Respond with a redirect message if this server is not the leader
+                    log("sending a redirect message back, this replica is not the leader")
+                    send_msg(msg[SRCE], RD, msg[MID])
+                elif my_state == State.leader:
+                    log("this replica is the leader, handling the GET/PUT message")
+                    handle_get_put(msg)
+                else:
+                    log("maybe throw an error? got a get/put request during an election ")
+
+            # Handle heartbeat messages.
+            elif msg_type == HB:
+                log("received a heartbeat message...")
+                last_heartbeat_recv = time.time()
+                # If an election is happening, stop it as there has been a leader chosen
+                if my_state == State.candidate:
+                    log("received a heartbeat message during an election, returning to follower state")
+                    my_state = State.follower
+                leader_id = msg[SRCE]
+
+            # Handle request vote messages
+            elif msg_type == RV:
+                if msg[TERM] not in terms_voted:
+                    # Good to vote for the server that sent the request vote message
+                    log("got a request vote message, voting for that replica")
+                    send_msg(msg[SRCE], VOTE, mid_received)
+                    terms_voted.append(current_term)
+            # Handle vote messages
+            elif msg_type == VOTE and my_state == State.candidate:
+                log("received a vote, updating tally")
+                votes_received += 1
+                if votes_received > len(replica_ids) / 2.0:
+                    # The election is won, set this server to the leader
+                    log("Votes received is greater than the number of replicas / 2, this replica won")
+                    my_state = State.leader
+                    leader_id = my_id
+                    # Send out a heartbeat message to everyone else, which informs the other servers of the new leader
+                    send_msg("FFFF", HB, string_to_mid(my_id))
+                    last_heartbeat_sent = time.time()
+
+    clock = time.time()
+    if (clock - last_heartbeat_recv > election_timeout and my_state == State.follower) or \
+            (time.time() - election_start > election_window and my_state == State.candidate):
+        # Start an election, it has been more than the election timeout since the last heartbeat message
+        # or start another election if the election window has passed
+        log("Starting an election")
+        votes_received = 0
+        current_term += 1
+        my_state = State.candidate
+
+        # Vote for itself
+        votes_received += 1
+        terms_voted.append(current_term)
+
+        mid = string_to_mid(my_id)
+        election_start = time.time()
+
+        # Send a request vote message to everyone else
+        log("sending RV messages to all other replicas")
+        for id in replica_ids:
+            msg = {"src": my_id, "dst": str(id), "leader": "FFFF",
+                   "type": RV, "MID": mid, "term": str(current_term)}
+            sock.send(json.dumps(msg).encode() + b'\n')
+    # Continue in this state until it wins the election, someone else wins(HB received), or the timeout passes
+
+    # If this server is a leader, send a heartbeat message every 2 seconds
+    if my_state == State.leader and time.time() - last_heartbeat_sent > heartbeat_interval:
+        send_msg("FFFF", HB, string_to_mid(my_id))
+        last_heartbeat_sent = time.time()
