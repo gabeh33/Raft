@@ -62,7 +62,7 @@ last_heartbeat_sent = 0
 
 # The interval that the server should send out a heartbeat, must be smaller than the
 # election_timeout
-heartbeat_interval = 0.1
+heartbeat_interval = 0.125
 
 # -----------------Messages-----------------#
 # The types of messages that can be sent or received
