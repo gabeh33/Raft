@@ -74,7 +74,7 @@ FAIL = "fail"
 HB = "heartbeat"
 RV = "requestVote"
 VOTE = "vote"
-
+A_E_RPC = "append_entries_rpc"
 # Fields of messages that must be there
 SRCE = 'src'
 DEST = 'dst'
@@ -86,12 +86,20 @@ TERM = 'term'  # Only for request vote RPCs, the term of the election to vote in
 KEY = 'key'
 VAL = 'value'
 OK = 'ok'
+UPDATES = 'updates'  # Used for append_entries_rpc calls, a list of updates to the log
 
 debug = True
 debug_data = ""
 
 # -----------------Key-Value Pairs-----------------#
 master_dict = {}
+my_log = []  # This is a log of all entries that this machine has seen from the user
+# When a user sends a request to the leader, add it to the leaders log. Then
+# the leader tries to send an a_e_rpc to all of the followers. If more than half
+# of the followers respond with OK then the leader can commit the entry to
+# master_dict. In subsequent a_e_rpc calls the leader will tell the followers
+# what log entries are safe to commit
+# An entry is a (key, value, term)
 
 # -----------------Variables Given------------------#
 
@@ -118,9 +126,21 @@ def string_to_mid(string):
 
 # send a basic message message
 def send_msg(dest_addr: str, type: str, mid: str):
-    msg = {"src": my_id, "dst": dest_addr, "leader": leader_id,
-           "type": type, "MID": mid}
+    msg = {SRCE: my_id, DEST: dest_addr, LEADER: leader_id,
+           TYPE: type, MID: mid}
     sock.send(json.dumps(msg).encode() + b'\n')
+
+
+# Send a AppendEntriesRPC
+def send_a_e_rpc(dest_addr: str, mid: str, updates: list):
+    msg = {SRCE: my_id, DEST: dest_addr, LEADER: leader_id,
+           TYPE: A_E_RPC, MID: mid, UPDATES: updates}
+    sock.send(json.dumps(msg).encode() + b'\n')
+
+
+# Sends a heartbeat message, used to make code more readable
+def send_heartbeat():
+    send_a_e_rpc("FFFF", string_to_mid(my_id), [])
 
 
 def handle_get_put(message):
@@ -139,10 +159,11 @@ def handle_get_put(message):
                    "type": OK, "MID": message[MID], "value": ""}
         sock.send(json.dumps(msg).encode() + b'\n')
     elif message[TYPE] == PUT:
+        # TODO make this send a_r_rpc calls and only update when consensus is reached
         log("Updating master dict with key " + key + " and value " + message[VAL])
         master_dict[key] = message[VAL]
         msg = {"src": my_id, "dst": message[SRCE], "leader": leader_id,
-                "type": OK, "MID": message[MID]}
+               "type": OK, "MID": message[MID]}
         sock.send(json.dumps(msg).encode() + b'\n')
     else:
         raise ValueError("Sent a message to handle_get_put() that was not a GET or PUT request!")
@@ -193,7 +214,7 @@ while True:
                     log("maybe throw an error? got a get/put request during an election ")
 
             # Handle heartbeat messages.
-            elif msg_type == HB:
+            elif msg_type == A_E_RPC:
                 log("received a heartbeat message...")
                 last_heartbeat_recv = time.time()
                 # If an election is happening, stop it as there has been a leader chosen
@@ -219,7 +240,7 @@ while True:
                     my_state = State.leader
                     leader_id = my_id
                     # Send out a heartbeat message to everyone else, which informs the other servers of the new leader
-                    send_msg("FFFF", HB, string_to_mid(my_id))
+                    send_heartbeat()
                     last_heartbeat_sent = time.time()
 
     clock = time.time()
@@ -247,7 +268,8 @@ while True:
             sock.send(json.dumps(msg).encode() + b'\n')
     # Continue in this state until it wins the election, someone else wins(HB received), or the timeout passes
 
-    # If this server is a leader, send a heartbeat message every 2 seconds
+    # If this server is a leader, send an empty a_e_rpc message every 2 seconds that
+    # there arnt any other a_e_rpc messages
     if my_state == State.leader and time.time() - last_heartbeat_sent > heartbeat_interval:
-        send_msg("FFFF", HB, string_to_mid(my_id))
+        send_heartbeat()
         last_heartbeat_sent = time.time()
