@@ -234,7 +234,7 @@ while True:
             elif msg_type == VOTE and my_state == State.candidate:
                 log("received a vote, updating tally")
                 votes_received += 1
-                if votes_received > len(replica_ids) // 2.0:
+                if votes_received > len(replica_ids) / 2.0:
                     # The election is won, set this server to the leader
                     log("Votes received is greater than the number of replicas / 2, this replica won")
                     my_state = State.leader
