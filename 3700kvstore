@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import enum
+import math
 import sys, socket, select, time, json, random
 
 # -----------------Program Arguments and Socket Connection-----------------#
@@ -75,6 +76,7 @@ HB = "heartbeat"
 RV = "requestVote"
 VOTE = "vote"
 A_E_RPC = "append_entries_rpc"
+A_OK = "append_okay"
 # Fields of messages that must be there
 SRCE = 'src'
 DEST = 'dst'
@@ -87,6 +89,8 @@ KEY = 'key'
 VAL = 'value'
 OK = 'ok'
 UPDATES = 'updates'  # Used for append_entries_rpc calls, a list of updates to the log
+COMMIT = 'commit'  # Used for append_entries_rpc, the followers should commit up to and including this index
+# from their log to their state machines
 
 debug = True
 debug_data = ""
@@ -100,7 +104,9 @@ my_log = []  # This is a log of all entries that this machine has seen from the 
 # master_dict. In subsequent a_e_rpc calls the leader will tell the followers
 # what log entries are safe to commit
 # An entry is a (key, value, term)
-
+highest_committed_index = -1  # The index of the last log entry that the leader knows is committed.
+# This value is included in heartbeats and a_e_rpc to tell the followers what to commit.
+mid_to_aok = {}  # A mapping from the mid sent in an a_e_rpc to the amount of A_OK messages it has received back
 # -----------------Variables Given------------------#
 
 last = 0
@@ -132,15 +138,19 @@ def send_msg(dest_addr: str, type: str, mid: str):
 
 
 # Send a AppendEntriesRPC
-def send_a_e_rpc(dest_addr: str, mid: str, updates: list):
+def send_a_e_rpc(dest_addr: str, updates: list, commit_index: int):
+    if updates:
+        mid = hash(updates[-1])
+    else:
+        mid = string_to_mid(my_id)
     msg = {SRCE: my_id, DEST: dest_addr, LEADER: leader_id,
-           TYPE: A_E_RPC, MID: mid, UPDATES: updates}
+           TYPE: A_E_RPC, MID: mid, UPDATES: updates, COMMIT: commit_index}
     sock.send(json.dumps(msg).encode() + b'\n')
 
 
 # Sends a heartbeat message, used to make code more readable
 def send_heartbeat():
-    send_a_e_rpc("FFFF", string_to_mid(my_id), [])
+    send_a_e_rpc("FFFF", [], highest_committed_index)
 
 
 def handle_get_put(message):
@@ -159,12 +169,17 @@ def handle_get_put(message):
                    "type": OK, "MID": message[MID], "value": ""}
         sock.send(json.dumps(msg).encode() + b'\n')
     elif message[TYPE] == PUT:
-        # TODO make this send a_r_rpc calls and only update when consensus is reached
-        log("Updating master dict with key " + key + " and value " + message[VAL])
-        master_dict[key] = message[VAL]
-        msg = {"src": my_id, "dst": message[SRCE], "leader": leader_id,
-               "type": OK, "MID": message[MID]}
-        sock.send(json.dumps(msg).encode() + b'\n')
+        # TODO make this send a_e_rpc calls and only update when consensus is reached
+        log("Updating log, sending out a_e_rpc to everyone else")
+        my_log.append((key, message[VAL], current_term))
+
+        # log("Updating master dict with key " + key + " and value " + message[VAL])
+        # master_dict[key] = message[VAL]
+        # msg = {"src": my_id, "dst": message[SRCE], "leader": leader_id,
+        # "type": OK, "MID": message[MID]}
+        # sock.send(json.dumps(msg).encode() + b'\n')
+        log("Sending A_E_RPC to all replicas with the new log entry")
+        send_a_e_rpc("FFFF", my_log[highest_committed_index + 1:], highest_committed_index)
     else:
         raise ValueError("Sent a message to handle_get_put() that was not a GET or PUT request!")
 
@@ -198,7 +213,6 @@ while True:
 
         for msg in msgs:
 
-            # For now, ignore get() and put() from clients
             msg_type = msg[TYPE]
             mid_received = msg[MID]
 
@@ -213,15 +227,44 @@ while True:
                 else:
                     log("maybe throw an error? got a get/put request during an election ")
 
-            # Handle heartbeat messages.
+            # Handle append_entries_rpc messages. This messages will always be from a leader -> follower
             elif msg_type == A_E_RPC:
-                log("received a heartbeat message...")
-                last_heartbeat_recv = time.time()
-                # If an election is happening, stop it as there has been a leader chosen
-                if my_state == State.candidate:
-                    log("received a heartbeat message during an election, returning to follower state")
-                    my_state = State.follower
-                leader_id = msg[SRCE]
+                if not msg[UPDATES]:
+                    # No updates just means this is a heartbeat message
+                    log("received a heartbeat message...")
+                    last_heartbeat_recv = time.time()
+                    # If an election is happening, stop it as there has been a leader chosen
+                    if my_state == State.candidate:
+                        log("received a heartbeat message during an election, returning to follower state")
+                        my_state = State.follower
+                    leader_id = msg[SRCE]
+                else:
+                    # Need to add the new entries to my_log and then send an ok message back.
+                    # Then need to commit if index received is bigger than highest committed index
+                    my_log.append(msg[UPDATES])  # Append updates to the log
+
+                    # Check if there are any new log entries to be committed
+                    if msg[COMMIT] > highest_committed_index:
+                        for i in range(highest_committed_index + 1, msg[COMMIT] + 1):
+                            master_dict[my_log[i][0]] = my_log[i][1]
+
+                    # Send A_OK messages back
+                    msg = {SRCE: my_id, DEST: msg[SRCE], MID: mid_received, TYPE: A_OK, UPDATES: msg[UPDATES]}
+                    sock.send(json.dumps(msg).encode() + b'\n')
+
+            elif msg_type == A_OK:
+                # Increment the tally for the specific mid
+                mid = msg[MID]
+                if mid not in mid_to_aok:
+                    mid_to_aok[mid] = 2  # set it to 2 because we assume the leader can replicate it on its log,
+                    # so the first A_OK it receives back will mean its replicated on 2 logs
+                else:
+                    mid_to_aok[mid] = mid_to_aok[mid] + 1
+
+            if mid_to_aok[mid] > (1 + len(replica_ids)) / 2.0:
+                # Replicated on a majority of replicas (including the leader), safe to commit
+                for log_entry in msg[UPDATES]:
+                    master_dict[log_entry[0]] = log_entry[1]
 
             # Handle request vote messages
             elif msg_type == RV:
@@ -234,9 +277,9 @@ while True:
             elif msg_type == VOTE and my_state == State.candidate:
                 log("received a vote, updating tally")
                 votes_received += 1
-                if votes_received > len(replica_ids) / 2.0:
+                if votes_received > (1 + len(replica_ids)) / 2.0:
                     # The election is won, set this server to the leader
-                    log("Votes received is greater than the number of replicas / 2, this replica won")
+                    log(F"Votes received is greater than the number of replicas / 2, this replica won, id:{str(my_id)}")
                     my_state = State.leader
                     leader_id = my_id
                     # Send out a heartbeat message to everyone else, which informs the other servers of the new leader
