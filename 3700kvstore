@@ -65,6 +65,8 @@ last_heartbeat_sent = 0
 # election_timeout
 heartbeat_interval = 0.3
 
+putcount = 0
+
 # -----------------Messages-----------------#
 # The types of messages that can be sent or received
 GET = "get"
@@ -113,8 +115,9 @@ highest_committed_index = -1  # The index of the last log entry that the leader 
 replica_commit_entries = [] # A (maybe empty) list of entries for all replicas to commit
 # This value is included in heartbeats and a_e_rpc to tell the followers what to commit.
 mid_to_aok = {}  # A mapping from the mid sent in an a_e_rpc to the amount of A_OK messages it has received back
-mid_time_sent = [] # List of (time, SRCE, MID) where time represents the time where a mid of a a_e_rpc was sent
-# second send a fail back
+mid_time_sent = [] # List of (time, CLIENT_SRCE, CLIENT_MID, random mid, updates) where time represents
+# the time where a mid of a a_e_rpc was sent if quorum is not reached after 1 second try again
+consensus_timeout = 0.4
 # -----------------Variables Given------------------#
 
 last = 0
@@ -159,23 +162,25 @@ def send_msg(dest_addr: str, type: str, mid: str):
 
 
 # Send a AppendEntriesRPC
-def send_a_e_rpc(dest_addr: str, updates: list, client_id: str, client_mid: str):
+def send_a_e_rpc(dest_addr: str, updates: list, client_id: str, client_mid: str, msg):
     if not updates:
         log("Sending heartbeat a_e_rpc")
     local_mid = get_random_mid()
     if updates:
         local_mid = str(hash(updates[-1]))
+        mid_time_sent.append((time.time(), client_id, client_mid, local_mid, updates, msg))
 
     msg = {SRCE: my_id, DEST: dest_addr, LEADER: leader_id,
            TYPE: A_E_RPC, MID: local_mid, UPDATES: updates,
-           COMMIT: highest_committed_index, CLIENT_ID: client_id, CLIENT_MID: client_mid}
+           COMMIT: highest_committed_index, CLIENT_ID: client_id, CLIENT_MID: client_mid,
+           TERM: current_term}
     sock.send(json.dumps(msg).encode() + b'\n')
     log(F"sent a_e_rpc MID:{msg[MID]}")
 
 
 # Sends a heartbeat message, used to make code more readable
 def send_heartbeat():
-    send_a_e_rpc("FFFF", [], "NOT USED", "NOT USED")
+    send_a_e_rpc("FFFF", [], "NOT USED", "NOT USED", "NOT USED")
 
 
 def handle_get_put(message):
@@ -197,10 +202,9 @@ def handle_get_put(message):
     elif message[TYPE] == PUT:
         log("Updating log, sending out a_e_rpc to everyone else")
         my_log.append((key, message[VAL], current_term))
-        send_a_e_rpc("FFFF", my_log, message[SRCE], message[MID])
-        tm = time.time()
+        send_a_e_rpc("FFFF", my_log, message[SRCE], message[MID], message)
 
-        mid_time_sent.append((tm, message[SRCE], message[MID]))
+
 
     else:
         raise ValueError("Sent a message to handle_get_put() that was not a GET or PUT request!")
@@ -262,13 +266,16 @@ while True:
                 if my_state == State.candidate:
                     log("received a heartbeat message during an election, returning to follower state")
                     my_state = State.follower
+
+                #TODO Maybe check the term and if its greater and this replica is a leader switch to follower
                 leader_id = msg[SRCE]
 
                 # If the highest index committed in the msg is greater than this replicas, commit up to that
                 # index
                 if msg[COMMIT] > highest_committed_index:
                     for i in range(highest_committed_index + 1, msg[COMMIT] + 1):
-                        master_dict[my_log[i][0]] = my_log[i][1]
+                        if i < len(my_log):
+                            master_dict[my_log[i][0]] = my_log[i][1]
                         highest_committed_index = msg[COMMIT]
 
                 if not msg[UPDATES]:
@@ -289,7 +296,7 @@ while True:
             elif msg_type == A_OK:
                 msg_mid = msg[MID]
 
-                if msg_mid not in mid_to_aok:
+                if msg_mid not in mid_to_aok or mid_to_aok[msg_mid] == -1: # Second clause if for if we are retrying
                     mid_to_aok[msg_mid] = (2, False)  # set it to 2 because we assume the leader can replicate it
                     # on its log,
                     # so the first A_OK it receives back will mean its replicated on 2 machines.
@@ -304,12 +311,20 @@ while True:
                     # Replicated on a majority of replicas (including the leader), safe to commit
                     log("Able to reach consensus, committing")
                     entry = msg[UPDATES]
-                    master_dict[entry[-1][0]] = entry[-1][1]
+                    master_dict[entry[-1][0]] = entry[-1][1] # Commit
 
-                    # Now add it to the replica_commit_entries field so other replicas commit it
+                    # Now increment highest_committed_index
                     replica_commit_entries.append(entry[-1])
                     highest_committed_index += 1
-                    # highest_committed_index += 1
+
+                    # Modify mid_time_sent
+                    remove_index = -1
+                    for i, entry in enumerate(mid_time_sent):
+                        if entry[2] == msg[CLIENT_MID]:
+                            mid_time_sent.pop(i)
+                            break
+
+
                     # Now need to send a response back to the client
                     log("Sending an OK message back to the client, as the key has been committed")
                     msg = {SRCE: my_id, DEST: msg[CLIENT_ID], TYPE: OK, LEADER: leader_id, MID: msg[CLIENT_MID]}
@@ -340,6 +355,20 @@ while True:
 
 
     clock = time.time()
+    # Check if any of the a_e_rpc have timed out
+    retry_list = []
+    for entry in mid_time_sent:
+        if clock - entry[0] > consensus_timeout:
+            output_log("=======================RETRYING COMMIT AS TIMEOUT HAS EXPIRED=========================")
+            request = entry[5]
+            output_log(request)
+            output_log("======================================================================================")
+            sock.send(json.dumps(request).encode() + b'\n')
+            mid_to_aok[entry[3]] = -1
+
+            #send_a_e_rpc("FFFF", my_log, entry[1], entry[2])
+            mid_time_sent.remove(entry)
+
 
     election_timeout_happened = clock - last_heartbeat_recv > election_timeout and my_state == State.follower
     election_window_passed = time.time() - election_start > election_window and my_state == State.candidate
