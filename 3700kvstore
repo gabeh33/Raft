@@ -87,6 +87,8 @@ TYPE = 'type'
 # Other fields
 MID = 'MID'
 TERM = 'term'  # Only for request vote RPCs, the term of the election to vote in
+LENGTH = 'length'
+LAST_ENTRY = 'last_entry'
 KEY = 'key'
 VAL = 'value'
 OK = 'ok'
@@ -118,6 +120,7 @@ mid_to_aok = {}  # A mapping from the mid sent in an a_e_rpc to the amount of A_
 mid_time_sent = [] # List of (time, CLIENT_SRCE, CLIENT_MID, random mid, updates) where time represents
 # the time where a mid of a a_e_rpc was sent if quorum is not reached after 1 second try again
 consensus_timeout = 0.4
+commit_prior_entries = False
 # -----------------Variables Given------------------#
 
 last = 0
@@ -233,6 +236,10 @@ def recv_msgs(sock):
 
 
 while True:
+    if commit_prior_entries:
+        for entry in my_log:
+            master_dict[entry[0]] = entry[1]
+        commit_prior_entries = False
     ready = select.select([sock], [], [], SELECT_WAIT_TIME)[0]
 
     if sock in ready:
@@ -253,7 +260,7 @@ while True:
                     log(F"this replica is the leader, handling the {str(msg_type)} message")
                     handle_get_put(msg)
                 else:
-                    log("Got a get/put during an election, sending redirect back")
+                    #log("Got a get/put during an election, sending redirect back")
                     send_msg(msg[SRCE], RD, msg[MID])
 
             # ---------------------APPEND ENTRIES RPC-------------------#
@@ -267,7 +274,11 @@ while True:
                     log("received a heartbeat message during an election, returning to follower state")
                     my_state = State.follower
 
-                #TODO Maybe check the term and if its greater and this replica is a leader switch to follower
+                if my_state == State.leader and msg[TERM] > current_term:
+                    my_state = State.follower
+                    continue
+                if msg[TERM] < current_term:
+                    continue
                 leader_id = msg[SRCE]
 
                 # If the highest index committed in the msg is greater than this replicas, commit up to that
@@ -283,7 +294,6 @@ while True:
                     log("received a heartbeat message...")
                 else:
                     # Need to add the new entries to my_log and then send an ok message back.
-                    # TODO reject it if something about terms, check paper
                     my_log.append(msg[UPDATES][-1])  # Append updates to the log
 
                     # Send A_OK messages back
@@ -318,12 +328,10 @@ while True:
                     highest_committed_index += 1
 
                     # Modify mid_time_sent
-                    remove_index = -1
                     for i, entry in enumerate(mid_time_sent):
                         if entry[2] == msg[CLIENT_MID]:
                             mid_time_sent.pop(i)
                             break
-
 
                     # Now need to send a response back to the client
                     log("Sending an OK message back to the client, as the key has been committed")
@@ -333,10 +341,25 @@ while True:
             # ---------------------REQUEST VOTE MESSAGES-------------------#
             elif msg_type == RV:
                 if msg[TERM] not in terms_voted:
-                    # Good to vote for the server that sent the request vote message
-                    log("got a request vote message, voting for that replica")
-                    send_msg(msg[SRCE], VOTE, mid_received)
-                    terms_voted.append(msg[TERM])
+                    can_vote = True
+                    if len(my_log) == 0:
+                        can_vote = True
+                    elif not msg[LAST_ENTRY]:
+                        can_vote = True
+                    elif msg[LAST_ENTRY][2] > my_log[-1][2]:
+                        can_vote = True
+                    elif msg[LAST_ENTRY][2] < my_log[-1][2]:
+                        can_vote = False
+                    elif msg[LAST_ENTRY][2] == my_log[-1][2]:
+                        if len(my_log) > msg[LENGTH]:
+                            can_vote = False
+                        else:
+                            can_vote = True
+                    if can_vote:
+                        # Good to vote for the server that sent the request vote message
+                        log("got a request vote message, voting for that replica")
+                        send_msg(msg[SRCE], VOTE, mid_received)
+                        terms_voted.append(msg[TERM])
             # Handle vote messages
             elif msg_type == VOTE and my_state == State.candidate:
                 log("received a vote, updating tally")
@@ -352,6 +375,7 @@ while True:
                     # Send out a heartbeat message to everyone else, which informs the other servers of the new leader
                     send_heartbeat()
                     last_heartbeat_sent = time.time()
+                    commit_prior_entries = True
 
 
     clock = time.time()
@@ -397,10 +421,14 @@ while True:
 
         # Send a request vote message to everyone else
         log("sending RV messages to all other replicas")
-        for id in replica_ids:
-            msg = {"src": my_id, "dst": str(id), "leader": "FFFF",
-                   "type": RV, "MID": mid, "term": str(current_term)}
-            sock.send(json.dumps(msg).encode() + b'\n')
+        if len(my_log) > 0:
+            last_ent = my_log[-1]
+        else:
+            last_ent = []
+        msg = {SRCE: my_id, DEST: "FFFF", LEADER: "FFFF",
+               TYPE: RV, MID: mid, TERM: current_term, LENGTH: len(my_log),
+               LAST_ENTRY: last_ent}
+        sock.send(json.dumps(msg).encode() + b'\n')
     # Continue in this state until it wins the election, someone else wins(HB received), or the timeout passes
 
     # If this server is a leader, send an empty a_e_rpc message every 2 seconds that
