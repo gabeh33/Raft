@@ -65,7 +65,6 @@ last_heartbeat_sent = 0
 # election_timeout
 heartbeat_interval = 0.3
 
-putcount = 0
 
 # -----------------Messages-----------------#
 # The types of messages that can be sent or received
@@ -98,7 +97,7 @@ COMMIT = 'commit'  # Used for append_entries_rpc, the followers should commit up
 CLIENT_ID = 'client_id' # This is the id of the client that sent a put request.
 CLIENT_MID = 'client_mid'
 
-debug = True
+debug = False
 output_logs = False
 last_log_output = 0
 debug_data = ""
