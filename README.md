@@ -8,4 +8,4 @@ on the replicas. There were times where I decided to take a slightly different a
 outlines. Once I was able to replicate data, I moved on to dealing with lossy connections. This also proved to be very challenging, but eventually I came up with
 a method where if consensus is not reached in a certain amount of time, the leader sends the exact same message that it received from a client back to itself. This 
 proved to work and while it is not the most efficient, it will work every time on lossy connections. I then implemented the smaller changes in 5.4.1 and 5.4.2. 
-Running the simulator on my local machine I was able to pass 15/17 tests and the vast majority of performance tests.  
+Running the simulator on my local machine I was able to pass all correction tests and the vast majority of performance tests.  
