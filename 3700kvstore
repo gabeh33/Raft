@@ -128,7 +128,6 @@ SELECT_WAIT_TIME = 0.01  # 10 milliseconds
 TERMINATOR = b'}\n'
 buffer = b''
 
-
 # Print the output given if debug is True
 def log(string):
     if debug:
